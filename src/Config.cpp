@@ -74,7 +74,7 @@ void Config::init()
 
     use_postag              = true;
 
-    language                = "english";
+    language                = "chinese";
     num_compose_tokens      = 2;
     compose_embedding_size  = 50;
     compose_weighted        = false;

@@ -90,7 +90,8 @@ class DependencyParser
         void save_model(const std::string & filename);
 
         void load_model(const char * filename, bool re_precompute = false);
-        void load_model(const std::string & filename, bool re_precompute = false);
+        void load_model(const char * filename, const char * embed_file, const char * test_file, bool re_precompute = false);
+        void load_model(const std::string & filename, const std::string & embed_file, const std::string & test_file, bool re_precompute = false);
 
         void load_model_cl(const char * filename, const char * clemb);
         void load_model_cl(
@@ -116,6 +117,7 @@ class DependencyParser
 
         int get_cluster_id(const std::string & c);
 
+        void Normalization_to_unitsphere(Mat<double>& embeddings);
     private:
         void generate_ids();
 

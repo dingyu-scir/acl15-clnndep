@@ -197,7 +197,7 @@ int main(int argc, char** argv)
     if (opt.is_test)
     {
         if (! loaded)
-            parser.load_model(opt.model_file, true);
+            parser.load_model(opt.model_file, opt.emb_file, opt.test_file, true);
         parser.test(opt.test_file,
                 opt.output_file,
                 true);

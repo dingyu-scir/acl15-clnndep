@@ -650,6 +650,8 @@ void DependencyParser::setup_classifier_for_training(
                 Eb[i][j] = (Util::rand_double() * 2 - 1) * config.init_range;
         }
     }
+    Normalization_to_unitsphere(Eb);
+
     #pragma omp parallel for
     for (int i = 0; i < Ed.nrows(); ++i)
         for (int j = 0; j < Ed.ncols(); ++j)
@@ -1041,6 +1043,26 @@ void DependencyParser::read_embed_file(const char * embed_file)
 void DependencyParser::save_model(const string & filename)
 {
     save_model(filename.c_str());
+}
+
+
+void DependencyParser::Normalization_to_unitsphere(Mat<double>& embeddings)
+{
+    double l2norm = 0.0;
+    for (int i=0; i< embeddings.nrows(); ++i)
+    {
+        double l2norm = 0.0;
+        for (int j=0; j< config.embedding_size; ++j)
+        {
+            l2norm += embeddings[i][j] * embeddings[i][j];
+        }
+        l2norm = 1.0/sqrt(l2norm);
+        for (int j=0; j< config.embedding_size; ++j)
+        {
+            embeddings[i][j] = embeddings[i][j] * l2norm;
+        }
+    }
+
 }
 
 void DependencyParser::save_model(const char * filename)
@@ -1626,9 +1648,301 @@ void DependencyParser::load_model(const char * filename, bool re_precompute)
     cerr << "Elapsed " << (end - start) << "s\n";
 }
 
-void DependencyParser::load_model(const string & filename, bool re_precompute)
+void loadwords_testfile(const char * test_file, std::vector<std::string>& test_words)
 {
-    load_model(filename.c_str(), re_precompute);
+    ifstream input(test_file);
+    std::string line;
+    if(input.fail()){
+      std::cerr << "fail to open test file: " << test_file << std::endl;
+      return;
+    }
+    while (getline(input, line)) {
+        std::vector<std::string> sep = split(line);
+        if (sep.size() != 10)
+          continue;
+        //if( find(test_words.begin(), test_words.end(), sep[1]) != test_words.end())
+        vector<string>::iterator iter;
+        for (iter = test_words.begin(); iter != test_words.end(); ++iter){
+          if (*iter == sep[1]){
+              break;
+          }
+        }
+
+        if (iter == test_words.end())
+            test_words.push_back(sep[1]);
+    }
+    cerr << test_words.size() << endl;
+    return;
+}
+
+void DependencyParser::load_model(const char * filename, const char * embed_file, const char * test_file, bool re_precompute)
+{
+    cerr << "Loading depparse model from " << filename << endl;
+
+    double start = get_time();
+
+    ifstream input(filename);
+
+    string s;
+    getline(input, s); int n_dict = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_pos = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_label = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_dist = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_valency = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_cluster = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Eb_size = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Ed_size = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Ev_size = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Ec_size = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int h_size = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_basic_tokens = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_dist_tokens = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_valency_tokens = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_cluster_tokens = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_pre_computed = to_int(split_by_sep(s, "=")[1]);
+
+    known_words.clear();
+    known_poss.clear();
+    known_labels.clear();
+    known_distances.clear();
+    known_valencies.clear();
+    known_clusters.clear();
+
+    int index = 0;
+
+    /*
+    if (config.use_postag)      Eb_entries += n_pos;
+    if (config.labeled)         Eb_entries += n_label;
+    if (!config.delexicalized)  Eb_entries += n_dict;
+    if (config.use_distance)    Ed_entries = n_dist;
+    if (config.use_valency)     Ev_entries = n_valency;
+    if (config.use_cluster)     Ec_entries = n_cluster;
+    */
+
+    int Eb_entries = n_label;
+    if (!config.delexicalized) Eb_entries += n_dict;
+    if (config.use_postag)     Eb_entries += n_pos;
+
+    int Ed_entries = n_dist;
+    int Ev_entries = n_valency;
+    int Ec_entries = n_cluster;
+    Mat<double> Em(n_dict, Eb_size);
+    Mat<double> Ed(Ed_entries, Ed_size);
+    Mat<double> Ev(Ev_entries, Ev_size);
+    Mat<double> Ec(Ec_entries, Ec_size);
+
+    if (!config.delexicalized)
+        for (int i = 0; i < n_dict; ++i)
+        {
+            getline(input, s);
+            vector<string> sep = split(s);
+            known_words.push_back(sep[0]);
+
+            assert (sep.size() == Eb_size + 1);
+            for (int j = 0; j < Eb_size; ++j)
+                Em[index][j] = to_double_sci(sep[j+1]);
+            index += 1;
+        }
+
+    /*added the pre-trained embeddings to the tail of Eb*/
+    std::vector<std::string> test_words;
+    loadwords_testfile(test_file, test_words);
+    std::cerr << "Loading embeddings from embedding file:" << embed_file << endl;
+    read_embed_file(embed_file);
+
+    int emb_items = 0;
+    for (int idx=0; idx < test_words.size(); ++idx) {
+        if (embed_ids.find(test_words[idx]) != embed_ids.end()){
+          emb_items += 1;
+        }
+    }
+
+    Mat<double> Eo(0.0, emb_items, Eb_size);
+    int additional = 0;
+    for (int idx=0; idx < test_words.size(); ++idx) {
+        if (embed_ids.find(test_words[idx]) != embed_ids.end()){
+          int i = 0;
+          for(i=0; i < known_words.size(); ++i) {
+              if(known_words[i] == test_words[idx])
+                  break;
+          }
+          if(i == known_words.size()){
+              int embed_index = embed_ids[test_words[idx]];
+              known_words.push_back(test_words[idx]);
+              assert(embeddings.ncols() == Eb_size);
+              for(int j=0; j < Eb_size; ++j) {
+                  Eo[additional][j] = embeddings[embed_index][j];
+              }
+              additional += 1;
+              index += 1;
+            }
+        }
+    }
+    Normalization_to_unitsphere(Eo);
+    /*end of read pre-trained embeddings*/
+
+    Mat<double>Eb(0.0, Eb_entries + additional, Eb_size);
+    int i;
+    for(i = 0; i < Em.nrows(); ++i)
+    {
+        for(int j=0; j < Em.ncols(); ++j)
+             Eb[i][j] = Em[i][j];
+    }
+    for (int k=0; k< additional; ++k)
+    {
+        for(int j=0; j< Eb_size; ++j)
+            Eb[i][j] = Eo[k][j];
+        i += 1;
+    }
+    cerr << "i=" <<i << ", index=" << index << endl;
+    assert(i == index);
+    /*end of read pre-trained embeddings*/
+
+    if (config.use_postag)
+        for (int i = 0; i < n_pos; ++i)
+        {
+            getline(input, s);
+            vector<string> sep = split(s);
+            known_poss.push_back(sep[0]);
+
+            assert (sep.size() == Eb_size + 1);
+            for (int j = 0; j < Eb_size; ++j)
+                Eb[index][j] = to_double_sci(sep[j+1]);
+            index += 1;
+        }
+
+    if (config.labeled)
+        for (int i = 0; i < n_label; ++i)
+        {
+            getline(input, s);
+            vector<string> sep = split(s);
+            known_labels.push_back(sep[0]);
+
+            assert (sep.size() == Eb_size + 1);
+            for (int j = 0; j < Eb_size; ++j)
+                Eb[index][j] = to_double_sci(sep[j+1]);
+            index += 1;
+        }
+    else
+    {
+        known_labels.push_back(Config::UNKNOWN); // confused =.=
+    }
+
+    index = 0; // reset
+    if (config.use_distance)
+        for (int i = 0; i < n_dist; ++i)
+        {
+            getline(input, s);
+            vector<string> sep = split(s);
+            known_distances.push_back(to_int(sep[0]));
+
+            assert (sep.size() == Ed_size + 1);
+            for (int j = 0; j < Ed_size; ++j)
+                Ed[index][j] = to_double_sci(sep[j+1]);
+            index += 1;
+        }
+
+    index = 0; // reset
+    if (config.use_valency)
+        for (int i = 0; i < n_valency; ++i)
+        {
+            getline(input, s);
+            vector<string> sep = split(s);
+            known_valencies.push_back(sep[0]);
+
+            assert (sep.size() == Ev_size + 1);
+            for (int j = 0; j < Ev_size; ++j)
+                Ev[index][j] = to_double_sci(sep[j+1]);
+            index += 1;
+        }
+
+    index = 0; // reset
+    if (config.use_cluster)
+        for (int i = 0; i < n_cluster; ++i)
+        {
+            getline(input, s);
+            vector<string> sep = split(s);
+            known_clusters.push_back(sep[0]);
+
+            assert (sep.size() == Ec_size + 1);
+            for (int j = 0; j < Ec_size; ++j)
+                Ec[index][j] = to_double_sci(sep[j+1]);
+            index += 1;
+        }
+
+    generate_ids();
+
+    int W1_ncol = Eb_size * n_basic_tokens
+                + Ed_size * n_dist_tokens
+                + Ev_size * n_valency_tokens
+                + Ec_size * n_cluster_tokens;
+
+    Mat<double> W1(h_size, W1_ncol);
+    for (int j = 0; j < W1.ncols(); ++j)
+    {
+        getline(input, s);
+        vector<string> sep = split(s);
+
+        assert (sep.size() == h_size);
+        for (int i = 0; i < W1.nrows(); ++i)
+            W1[i][j] = to_double_sci(sep[i]);
+    }
+
+    Vec<double> b1(h_size);
+    getline(input, s);
+    vector<string> sep = split(s);
+    assert (sep.size() == h_size);
+    for (int i = 0; i < b1.size(); ++i)
+    {
+        b1[i] = to_double_sci(sep[i]);
+    }
+
+    int n_actions = (config.labeled) ? (n_label * 2 - 1) : 3;
+    Mat<double> W2(n_actions, h_size);
+    for (int j = 0; j < W2.ncols(); ++j)
+    {
+        getline(input, s);
+        vector<string> sep = split(s);
+        assert (sep.size() == n_actions);
+        for (int i = 0; i < W2.nrows(); ++i)
+            W2[i][j] = to_double_sci(sep[i]);
+    }
+
+    pre_computed_ids.clear();
+    while (pre_computed_ids.size() < (size_t)n_pre_computed)
+    {
+        getline(input, s);
+        vector<string> sep = split(s);
+        for (size_t i = 0; i < sep.size(); ++i)
+            pre_computed_ids.push_back(to_int(sep[i]));
+    }
+
+    input.close();
+    if (re_precompute)
+        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, vector<int>());
+    else
+        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, pre_computed_ids);
+
+    vector<string> ldict = known_labels;
+    if (config.labeled) ldict.pop_back(); // remove the NIL label
+    system = new ArcStandard(ldict, config.language, config.labeled);
+
+    if (!re_precompute && config.num_pre_computed > 0)
+        classifier->pre_compute();
+
+    double end = get_time();
+    cerr << "Elapsed " << (end - start) << "s\n";
+
+    save_model("tmp");
+}
+
+void DependencyParser::load_model(const string & filename, const std::string & embed_file, const std::string & test_file, bool re_precompute)
+{
+    if( !config.fix_word_embeddings)
+        load_model(filename.c_str(), re_precompute);
+    else
+        load_model(filename.c_str(), embed_file.c_str(), test_file.c_str(), re_precompute );
+
 }
 
 /**
