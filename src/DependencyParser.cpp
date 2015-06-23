@@ -1045,7 +1045,11 @@ void DependencyParser::save_model(const string & filename)
     save_model(filename.c_str());
 }
 
-
+/**
+ *the normalization formula is:
+  x_vec_norm = x_vec / ||x_vec||2
+             = power(sum(xi * xi), -1/2) * x_vec
+ */
 void DependencyParser::Normalization_to_unitsphere(Mat<double>& embeddings)
 {
     double l2norm = 0.0;
@@ -1779,7 +1783,6 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
         }
     }
     Normalization_to_unitsphere(Eo);
-    /*end of read pre-trained embeddings*/
 
     Mat<double>Eb(0.0, Eb_entries + additional, Eb_size);
     int i;
@@ -1794,7 +1797,6 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
             Eb[i][j] = Eo[k][j];
         i += 1;
     }
-    cerr << "i=" <<i << ", index=" << index << endl;
     assert(i == index);
     /*end of read pre-trained embeddings*/
 
