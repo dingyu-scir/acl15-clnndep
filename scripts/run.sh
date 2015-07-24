@@ -1,6 +1,6 @@
 #!/bin/bash
 ROOT=`pwd`
-SIG=`date '+%Y-%m-%d-%H%M%S'`neural-giga.sdp.finetuningorfix.normornon-norm
+SIG=`date '+%Y-%m-%d-%H%M%S'`neural-giga.sdp.gradient_check
 WORKSPACE=${ROOT}/workspace/${SIG}
 
 MODEL_DIR=${WORKSPACE}/model
@@ -14,7 +14,7 @@ mkdir -p ${EXE_DIR}
 MODEL_PREFIX=${MODEL_DIR}/model
 
 CFG=${EXE_DIR}/nndep.cfg.${SIG}
-cp ${ROOT}/conf/nndep.cfg  ${CFG}
+cp ${ROOT}/conf/debug.cfg  ${CFG}
 
 EXE=${EXE_DIR}/nndep.${SIG}
 cp ${ROOT}/bin/$1  ${EXE}
@@ -34,7 +34,7 @@ F_OUTPUT=${OUTPUT_DIR}/test.out.sdp
 #EMBED=./data/giga.ctb7.added2
 #EMBED=~/yoavgo-word2vecf-90e299816bcd/giga-r47-output/dim50vecs.bin
 #EMBED=/users2/yding/wang2vec-master/giga.50.embed
-EMBED=/users2/yding/Word2vector/giga-50.w1.bin
+EMBED=/users2/yding/Word2vector/giga-2.w1.bin
 #EMBED=./data/ctb5.pretraining.wangadded
 #EMBED=./data/ctb5.pretraining.added
 #EMBED=./data/cdt.pretraining.added

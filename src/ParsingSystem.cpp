@@ -129,7 +129,8 @@ void ParsingSystem::evaluate(
         {
             cerr << "Error: Tree "
                  << (i + 1)
-                 << " has incorrect number of nodes"
+                 << " has incorrect number of nodes="
+                 << sents[i].n << " , pred_trees[i].n=" << pred_trees[i].n 
                  << endl;
             return ;
         }

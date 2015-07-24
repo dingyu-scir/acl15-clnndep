@@ -23,7 +23,8 @@ set (clnndep_SRC
      ParsingSystem.h
      ThreadPool.h
      time.h
-     Util.h)
+     Util.h
+     )
 
 add_executable (clnndep ${clnndep_SRC})
 

@@ -116,7 +116,6 @@ class Config
          * whether use postag feature
          */
         bool use_postag;
-
         std::string language;
 
         /**
@@ -132,6 +131,9 @@ class Config
         int compose_activation;
 
         bool debug;
+        bool embedding_project;
+        bool normalization;
+        int beam_size;
 
     public:
         Config();
@@ -162,6 +164,7 @@ class Config
                 std::map<std::string, std::string>& props,
                 const char * name,
                 bool& variable);
+
 };
 
 #endif

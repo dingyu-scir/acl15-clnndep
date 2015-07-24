@@ -14,6 +14,8 @@ class Configuration
         Configuration(DependencySent& s);
         ~Configuration() {}
 
+        void copy(Configuration& c);
+        
         void init(DependencySent& s);
 
         /**
@@ -93,6 +95,8 @@ class Configuration
         DependencyTree tree;
         DependencySent sent;
 
+        double score=1.0; // used for beam search decoding, recoding a cascaded
+                      // score for each state.
         std::vector<int> lvalency;
         std::vector<int> rvalency;
 };

@@ -4,6 +4,7 @@
 #include <vector>
 // #include <map>
 #include <unordered_map>
+#include <boost/tuple/tuple.hpp>
 
 #include "math/mat.h"
 #include "Config.h"
@@ -14,6 +15,7 @@
 class DependencyParser
 {
     public:
+        DependencyParser();
         DependencyParser(const char * cfg_filename);
         DependencyParser(std::string& cfg_filename);
         ~DependencyParser(); // TODO
@@ -64,7 +66,8 @@ class DependencyParser
 
         void gen_dictionaries(
                 std::vector<DependencySent> & sents,
-                std::vector<DependencyTree> & trees);
+                std::vector<DependencyTree> & trees,
+                std::vector<DependencySent> & dev_sents);
 
         void collect_dynamic_features(
                 std::vector<DependencySent> & sents,
@@ -100,10 +103,16 @@ class DependencyParser
 
         void predict(
                 std::vector<DependencySent>& sents,
-                std::vector<DependencyTree>& trees);
+                std::vector<DependencyTree>& trees,
+                const int & dev_test_flag);
         void predict(
                 DependencySent& sent,
-                DependencyTree& tree);
+                DependencyTree& tree,
+                const int & dev_test_flag);
+        void predict_global(
+                DependencySent& sent,
+                DependencyTree& tree,
+                const int & dev_test_flag);
 
         std::vector<int> get_features(Configuration& c);
         // Vec<int> get_features_array(Configuration& c);
@@ -147,6 +156,22 @@ class DependencyParser
         std::unordered_map<std::string, int> embed_ids;
 
         Config config;
+        
+        static int dev_test_flag;
+        typedef boost::tuples::tuple<Configuration*, std::string, double> scored_transition_t;
+        scored_transition_t* candidate_transitions;
+        std::vector<int> lattice_size;
+        std::vector<Configuration*> lattice_heads;
+        Configuration* row;
+
+    public:
+        //! The comparsion function between two scored transition.
+        static bool ScoredTransitionMore(const scored_transition_t& x,
+            const scored_transition_t& y) {
+            return x.get<2>() > y.get<2>();
+        }
+        int extend_candidate_transitions(const scored_transition_t& trans, int current_beam_size);
+        Configuration* allocate_lattice(int index);
 };
 
 #endif

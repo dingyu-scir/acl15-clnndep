@@ -44,7 +44,7 @@ void Config::init()
     ada_alpha               = 0.010;
     reg_parameter           = 1.0e-8;
     dropout_prob            = 0.50;
-    hidden_size             = 200;
+    hidden_size             = 400;
     embedding_size          = 50;
 
     num_tokens              = 48;
@@ -83,6 +83,9 @@ void Config::init()
     compose_activation      = 0;
 
     debug                   = false;
+    embedding_project       = false;
+    normalization           = false;
+    beam_size               = 0;
 }
 
 void Config::set_properties(const char * filename)
@@ -145,6 +148,7 @@ void Config::set_properties(const char * filename)
     cfg_set_int(props, "num_compose_tokens",        num_compose_tokens);
     cfg_set_int(props, "max_compose_layers",        max_compose_layers);
     cfg_set_int(props, "compose_activation",        compose_activation);
+    cfg_set_int(props, "beam_size",                 beam_size);
 
     cfg_set_double(props, "init_range",             init_range);
     cfg_set_double(props, "ada_eps",                ada_eps);
@@ -161,8 +165,11 @@ void Config::set_properties(const char * filename)
     cfg_set_boolean(props, "use_valency",           use_valency);
     cfg_set_boolean(props, "use_cluster",           use_cluster);
     cfg_set_boolean(props, "debug",                 debug);
+    cfg_set_boolean(props, "embedding_project",     embedding_project);
     cfg_set_boolean(props, "compose_weighted",      compose_weighted);
     cfg_set_boolean(props, "compose_by_position",   compose_by_position);
+    cfg_set_boolean(props, "normalization",         normalization);
+
     // cfg_set_boolean(props, "use_postag",            use_postag);
 
     if (props.find("language") != props.end())
@@ -270,6 +277,10 @@ void Config::print_info()
     cerr << "compose_activation      = " << compose_activation      << endl;
 
     cerr << "debug                   = " << debug                   << endl;
+    cerr << "embedding_project       = " << embedding_project       << endl;
+    cerr << "normalization           = " << normalization           << endl;
+    cerr << "language                = " << language                << endl;
+    cerr << "beam_size               = " << beam_size               << endl;
 }
 
 int Config::get_embedding_size(int feat_type)

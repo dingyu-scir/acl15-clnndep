@@ -29,6 +29,8 @@ unordered_map<int, int> NNClassifier::pre_map;
 Mat<double> NNClassifier::W1;
 Vec<double> NNClassifier::b1;
 Mat<double> NNClassifier::W2;
+Mat<double> NNClassifier::P;
+Mat<double> NNClassifier::project;
 
 Mat<double> NNClassifier::Eb;
 Mat<double> NNClassifier::Ed;
@@ -69,6 +71,7 @@ NNClassifier::NNClassifier(
         const Mat<double>& _W1,
         const Vec<double>& _b1,
         const Mat<double>& _W2,
+        const Mat<double>& _P,
         const vector<int>& pre_computed_ids)
 {
     // NNClassifier(_config, Dataset(), _E, _W1, _b1, _W2, pre_computed_ids);
@@ -80,6 +83,7 @@ NNClassifier::NNClassifier(
     W1 = _W1;
     b1 = _b1;
     W2 = _W2;
+    P  = _P;
 
     num_labels = W2.nrows();
 
@@ -91,6 +95,10 @@ NNClassifier::NNClassifier(
         pre_map[pre_computed_ids[i]] = i;
     }
     // */
+    project.resize(Eb.nrows(), Eb.ncols());
+    for (int i=0; i< Eb.nrows(); ++i)
+        for (int j=0; j < Eb.ncols(); ++j)
+              project[i][j] = 0.0;
 }
 
 NNClassifier::NNClassifier(
@@ -103,6 +111,7 @@ NNClassifier::NNClassifier(
         const Mat<double>& _W1,
         const Vec<double>& _b1,
         const Mat<double>& _W2,
+        const Mat<double>& _P,
         const vector<int>& pre_computed_ids)
 {
     config = _config;
@@ -114,6 +123,7 @@ NNClassifier::NNClassifier(
     W1 = _W1;
     b1 = _b1;
     W2 = _W2;
+    P  = _P;
 
     init_gradient_histories();
 
@@ -137,7 +147,10 @@ NNClassifier::NNClassifier(
     grad_E.resize(E.nrows(), E.ncols());
     */
     grad_saved.resize(pre_map.size(), config.hidden_size);
-
+    project.resize(Eb.nrows(), Eb.ncols());
+    for (int i=0; i< Eb.nrows(); ++i)
+        for (int j=0; j < Eb.ncols(); ++j)
+              project[i][j] = 0.0;
     // debug = false;
 }
 
@@ -170,6 +183,7 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
     Mat<double> grad_W1(0.0, W1.nrows(), W1.ncols());
     Vec<double> grad_b1(0.0, b1.size());
     Mat<double> grad_W2(0.0, W2.nrows(), W2.ncols());
+    Mat<double> grad_P(0.0,  P.nrows(),  P.ncols());
     Mat<double> grad_Eb(0.0, Eb.nrows(), Eb.ncols());
     Mat<double> grad_Ed(0.0, Ed.nrows(), Ed.ncols());
     Mat<double> grad_Ev(0.0, Ev.nrows(), Ev.ncols());
@@ -197,7 +211,6 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
         vector<int>& features = chunk[i].get_feature();
 
         vector<int>& label = chunk[i].get_label();
-
         // feed forward the neural net
         Vec<double> scores(0.0, num_labels);
         Vec<double> hidden(0.0, config.hidden_size);
@@ -251,9 +264,21 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
                     int node_index = active_units[k];
                     if (feat_type == Config::BASIC_FEAT)
                     {
-                        for (int l = 0; l < emb_size; ++l)
-                            hidden[node_index] +=
-                                W1[node_index][offset+l] * Eb[E_index][l];
+                        if (config.embedding_project) {   // E'[dim] = E[dim] * Matrix[dim][dim]
+                            for (int l = 0; l < emb_size; ++l)  // projection layer index
+                            {
+                                double project_tmp = 0.0;
+                                for (int r = 0; r < emb_size; ++r)  // input layer index(word embeddings)
+                                    project_tmp += P[l][r] * Eb[E_index][r];
+                                hidden[node_index] +=
+                                    W1[node_index][offset+l] * project_tmp;
+                            }
+                        }
+                        else {
+                            for (int l = 0; l < emb_size; ++l)
+                                hidden[node_index] +=
+                                    W1[node_index][offset+l] * Eb[E_index][l];
+                        }
                     }
                     else if (feat_type == Config::DIST_FEAT)
                     {
@@ -320,13 +345,6 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
                     opt_label = j;
         }
 
-        /*
-        cerr << "unnormalized scores: " << endl;
-        for (int j = 0; j < scores.size(); ++j)
-            cerr << scores[j] << " ";
-        cerr << endl;
-        */
-
         double sum1 = .0;
         double sum2 = .0;
         double max_score = scores[opt_label];
@@ -391,7 +409,7 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
         }
 
         Vec<double> grad_hidden(0.0, config.hidden_size);
-        // #pragma omp parallel for
+        #pragma omp parallel for
         for (size_t j = 0; j < active_units.size(); ++j)
         {
             int node_index = active_units[j];
@@ -432,6 +450,23 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
             else
             {
             // */
+                Vec<double>grad_project(0.0, emb_size); // the gradient of the projection embedding
+                if(config.embedding_project)
+                    for (size_t k = 0; k < active_units.size(); ++k)
+                    {
+                        int node_index = active_units[k];
+                        for (int l = 0; l < emb_size; ++l)
+                            if(feat_type == Config::BASIC_FEAT)
+                                grad_project[l] += grad_hidden[node_index] * W1[node_index][offset+l];
+                    }
+
+                //cerr << "update E_index=" << E_index << endl;
+                Vec<double> project_tmp(0.0, emb_size);
+                if (feat_type == Config::BASIC_FEAT)
+                    for (int l = 0; l < emb_size; ++l)
+                        for(int r = 0; r < emb_size; ++r)
+                            project_tmp[l] += Eb[E_index][r] * P[l][r];
+
                 for (size_t k = 0; k < active_units.size(); ++k)
                 {
                     int node_index = active_units[k];
@@ -439,10 +474,23 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
                     {
                         if (feat_type == Config::BASIC_FEAT)
                         {
-                            grad_W1[node_index][offset+l] +=
-                                grad_hidden[node_index] * Eb[E_index][l];
-                            grad_Eb[E_index][l] +=
-                                grad_hidden[node_index] * W1[node_index][offset+l];
+                            if (config.embedding_project)
+                            {
+                                grad_W1[node_index][offset+l] +=
+                                    grad_hidden[node_index] * project_tmp[l];
+                                for (int r = 0; r < emb_size; ++r)
+                                {
+                                    grad_Eb[E_index][r] += grad_project[l] * P[l][r];
+                                    grad_P[l][r] += grad_project[l] * Eb[E_index][r];
+                                }
+                            }
+                            else
+                            {
+                                grad_W1[node_index][offset+l] +=
+                                    grad_hidden[node_index] * Eb[E_index][l];
+                                grad_Eb[E_index][l] +=
+                                    grad_hidden[node_index] * W1[node_index][offset+l];
+                            }
                         }
                         else if (feat_type == Config::DIST_FEAT)
                         {
@@ -466,7 +514,7 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
                                 grad_hidden[node_index] * W1[node_index][offset+l];
                         }
 
-                    }
+                    } //cerr << endl;
                 }
             }
             offset += emb_size;
@@ -486,6 +534,7 @@ Cost NNClassifier::thread_proc(vector<Sample> & chunk, size_t batch_size)
                 grad_Ed,
                 grad_Ev,
                 grad_Ec,
+                grad_P,
                 dropout_histories);
 
     /*
@@ -567,6 +616,10 @@ void NNClassifier::compute_cost_function()
         for (int j = 0; j < grad_saved.ncols(); ++j)
             grad_saved[i][j] = 0.0;
 
+    for (int i = 0; i < project.nrows(); ++i)
+        for (int j = 0; j < project.ncols(); ++j)
+            project[i][j] = 0.0;
+
     // cerr << "build thread pool..." << endl;
     ThreadPool pool(num_chunks);
     vector< future<Cost> > results;
@@ -607,7 +660,7 @@ void NNClassifier::compute_cost_function()
 
 void NNClassifier::back_prop_saved(Cost& cost, vector<int> & features_seen)
 {
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for (size_t i = 0; i < features_seen.size(); ++i)
     {
         // cerr << "cost.grad_Eb[0][0]" << cost.grad_Eb[0][0] << endl;
@@ -630,15 +683,46 @@ void NNClassifier::back_prop_saved(Cost& cost, vector<int> & features_seen)
         else if (feat_type == Config::CLUSTER_FEAT)
             E_index -= Eb.nrows() + Ed.nrows() + Ev.nrows();
 
+        Vec<double>grad_project(0.0, emb_size);
+        //cerr << "start cal grad_project" << endl;
+        if (config.embedding_project)
+            for (int j = 0; j < config.hidden_size; ++j)
+            {
+                double delta = grad_saved[map_x][j];
+                if (feat_type == Config::BASIC_FEAT)
+                    for (int k = 0; k < emb_size; ++k)
+                        grad_project[k] += delta * W1[j][offset+k];
+            }
+        //cerr << grad_project[0] << endl;
+        Vec<double> project_tmp(0.0, emb_size);
+        if (feat_type == Config::BASIC_FEAT)
+            for (int l = 0; l < emb_size; ++l)
+                for(int r = 0; r < emb_size; ++r)
+                    project_tmp[l] += Eb[E_index][r] * P[l][r];
+
         for (int j = 0; j < config.hidden_size; ++j)
         {
             double delta = grad_saved[map_x][j];
             if (feat_type == Config::BASIC_FEAT)
+            {
                 for (int k = 0; k < emb_size; ++k)
                 {
-                    cost.grad_W1[j][offset + k] += delta * Eb[E_index][k];
-                    cost.grad_Eb[E_index][k] += delta * W1[j][offset + k];
+                    if(config.embedding_project)
+                    {
+                        cost.grad_W1[j][offset + k] += delta * project_tmp[k];
+                        for (int r = 0; r < emb_size; ++r)
+                        {
+                             cost.grad_Eb[E_index][r] += grad_project[k] * P[k][r];
+                             cost.grad_P[k][r] += grad_project[k] * Eb[E_index][r];
+                        }
+                    }
+                    else
+                    {
+                        cost.grad_W1[j][offset + k] += delta * Eb[E_index][k];
+                        cost.grad_Eb[E_index][k] += delta * W1[j][offset + k];
+                    }
                 }
+            }
             else if (feat_type == Config::DIST_FEAT)
                 for (int k = 0; k < emb_size; ++k)
                 {
@@ -683,6 +767,16 @@ void NNClassifier::add_l2_regularization(Cost& cost)
     {
         cost.loss += config.reg_parameter * b1[i] * b1[i] / 2.0;
         cost.grad_b1[i] += config.reg_parameter * b1[i];
+    }
+
+    if (config.embedding_project) {
+        //cerr << regularize P" << endl;
+        for (int i=0; i < P.nrows(); ++i)
+            for (int j=0; j < P.ncols(); ++j)
+            {
+                cost.loss += config.reg_parameter * P[i][j] * P[i][j] / 2.0;
+                cost.grad_P[i][j] += config.reg_parameter * P[i][j];
+            }
     }
 
     // cerr << "regularize W2" << endl;
@@ -777,6 +871,7 @@ void NNClassifier::check_gradient()
      * @grad_W1
      * @grad_E
      * @grad_b1
+     * @grad_P
      *
      */
     init_gradient_histories();
@@ -787,6 +882,7 @@ void NNClassifier::check_gradient()
     Mat<double> num_grad_W1(0.0, cost.grad_W1.nrows(), cost.grad_W1.ncols());
     Mat<double> num_grad_W2(0.0, cost.grad_W2.nrows(), cost.grad_W2.ncols());
     Vec<double> num_grad_b1(0.0, cost.grad_b1.size());
+    Mat<double> num_grad_P(0.0,  cost.grad_P.nrows(),  cost.grad_P.ncols());
     Mat<double> num_grad_Eb(0.0, cost.grad_Eb.nrows(), cost.grad_Eb.ncols());
     Mat<double> num_grad_Ed(0.0, cost.grad_Ed.nrows(), cost.grad_Ed.ncols());
     Mat<double> num_grad_Ev(0.0, cost.grad_Ev.nrows(), cost.grad_Ev.ncols());
@@ -800,7 +896,8 @@ void NNClassifier::check_gradient()
             num_grad_Eb,
             num_grad_Ed,
             num_grad_Ev,
-            num_grad_Ec);
+            num_grad_Ec,
+            num_grad_P);
 
     // second step: compute the diff between two gradients
     // norm(numgrad-grad) / norm(numgrad+grad) should be small
@@ -819,15 +916,21 @@ void NNClassifier::check_gradient()
     double diff_grad_Ed = Util::l2_norm(Util::mat_subtract(num_grad_Ed, cost.grad_Ed)) / Util::l2_norm(Util::mat_add(num_grad_Ed, cost.grad_Ed));
     double diff_grad_Ev = Util::l2_norm(Util::mat_subtract(num_grad_Ev, cost.grad_Ev)) / Util::l2_norm(Util::mat_add(num_grad_Ev, cost.grad_Ev));
     double diff_grad_Ec = Util::l2_norm(Util::mat_subtract(num_grad_Ec, cost.grad_Ec)) / Util::l2_norm(Util::mat_add(num_grad_Ec, cost.grad_Ec));
+    double diff_grad_P =  Util::l2_norm(Util::mat_subtract(num_grad_P,  cost.grad_P))  / Util::l2_norm(Util::mat_add(num_grad_P,  cost.grad_P));
 
-    /*
-    for (int i = 0; i < num_grad_W2.nrows(); ++i)
+    for (int i = 0; i < num_grad_P.nrows(); ++i)
     {
-        for (int j = 0; j < num_grad_W2.ncols(); ++j)
-            cerr << num_grad_W2[i][j] << " ";
+        for (int j = 0; j < num_grad_P.ncols(); ++j)
+            cerr << num_grad_P[i][j] << " ";
         cerr << endl;
     }
-    */
+    for (int i = 0; i < num_grad_P.nrows(); ++i)
+    {
+        for (int j = 0; j < cost.grad_P.ncols(); ++j)
+            cerr << cost.grad_P[i][j] << " ";
+        cerr << endl;
+    }
+
 
     cerr << "diff(W1) = " << diff_grad_W1 << endl;
     cerr << "diff(b1) = " << diff_grad_b1 << endl;
@@ -836,6 +939,7 @@ void NNClassifier::check_gradient()
     cerr << "diff(Ed) = " << diff_grad_Ed << endl;
     cerr << "diff(Ev) = " << diff_grad_Ev << endl;
     cerr << "diff(Ec) = " << diff_grad_Ec << endl;
+    cerr << "diff(P)  = " << diff_grad_P  << endl;
 }
 
 void NNClassifier::compute_numerical_gradients(
@@ -845,7 +949,8 @@ void NNClassifier::compute_numerical_gradients(
         Mat<double> & num_grad_Eb,
         Mat<double> & num_grad_Ed,
         Mat<double> & num_grad_Ev,
-        Mat<double> & num_grad_Ec)
+        Mat<double> & num_grad_Ec,
+        Mat<double> & num_grad_P)
 {
     if (samples.size() == 0)
     {
@@ -854,6 +959,7 @@ void NNClassifier::compute_numerical_gradients(
     }
 
     double epsilon = 1e-6;
+
     cerr << "checking W1..." << endl;
     // cerr << num_grad_W1.nrows() << ", " << num_grad_W1.ncols() << endl;
     cerr << W1.nrows() << ", " << W1.ncols() << endl;
@@ -867,6 +973,22 @@ void NNClassifier::compute_numerical_gradients(
             num_grad_W1[i][j] = (p_eps_cost - n_eps_cost) / (2 * epsilon);
             W1[i][j] += epsilon; // reset
         }
+
+    if (config.embedding_project) {
+        cerr << "checking P..." << endl;
+        // cerr << num_grad_P.nrows() << ", " << num_grad_P.ncols() << endl;
+        cerr << P.nrows() << ", " << P.ncols() << endl;
+        for (int i = 0; i < P.nrows(); ++i)
+            for (int j = 0; j < P.ncols(); ++j)
+            {
+                P[i][j] += epsilon;
+                double p_eps_cost = compute_cost();
+                P[i][j] -= 2 * epsilon;
+                double n_eps_cost = compute_cost();
+                num_grad_P[i][j] = (p_eps_cost - n_eps_cost) / (2 * epsilon);
+                P[i][j] += epsilon; // reset
+            }
+    }
 
     cerr << "checking b1..." << endl;
     for (int i = 0; i < b1.size(); ++i)
@@ -979,14 +1101,31 @@ double NNClassifier::compute_cost()
             int emb_size = config.get_embedding_size(feat_type);
             // embedding size for current token
 
+            Vec<double> project_tmp(0.0, emb_size);
+            if (feat_type == Config::BASIC_FEAT)
+                for (int l = 0; l < emb_size; ++l)
+                    for(int r = 0; r < emb_size; ++r)
+                        project_tmp[l] += Eb[E_index][r] * P[l][r];
+
             for (size_t k = 0; k < active_units.size(); ++k)
             {
                 int node_index = active_units[k];
                 if (feat_type == Config::BASIC_FEAT)
                 {
-                    for (int l = 0; l < emb_size; ++l)
-                        hidden[node_index] +=
-                            W1[node_index][offset+l] * Eb[E_index][l];
+                    if (config.embedding_project)
+                    {
+                        for (int l = 0; l < emb_size; ++l)
+                        {
+                            hidden[node_index] +=
+                                W1[node_index][offset + l] * project_tmp[l];
+                        }
+                    }
+                    else
+                    {
+                        for (int l = 0; l < emb_size; ++l)
+                            hidden[node_index] +=
+                                W1[node_index][offset+l] * Eb[E_index][l];
+                    }
                 }
                 else if (feat_type == Config::DIST_FEAT)
                 {
@@ -1061,6 +1200,18 @@ double NNClassifier::compute_cost()
         }
     }
 
+    if (config.embedding_project)
+        for (int i = 0; i < P.nrows(); ++i)
+        {
+            for (int j = 0; j < P.ncols(); ++j)
+            {
+                v_cost += config.reg_parameter
+                        * P[i][j]
+                        * P[i][j]
+                        / 2.0;
+            }
+        }
+
     for (int i = 0; i < b1.size(); ++i)
     {
         v_cost += config.reg_parameter * b1[i] * b1[i] / 2.0;
@@ -1122,6 +1273,17 @@ void NNClassifier::take_ada_gradient_step(int E_start_pos)
                     sqrt(eg2W1[i][j] + config.ada_eps);
         }
     }
+
+    if(config.embedding_project)
+        for (int i = 0; i < P.nrows(); ++i)
+        {
+            for (int j = 0; j < P.ncols(); ++j)
+            {
+                eg2P[i][j] += cost.grad_P[i][j] * cost.grad_P[i][j];
+                P[i][j] -= config.ada_alpha * cost.grad_P[i][j] /
+                        sqrt(eg2P[i][j] + config.ada_eps);
+            }
+        }
 
     for (int i = 0; i < b1.size(); ++i)
     {
@@ -1226,6 +1388,11 @@ Mat<double>& NNClassifier::get_W1()
     return W1;
 }
 
+Mat<double>& NNClassifier::get_P()
+{
+    return P;
+}
+
 Mat<double>& NNClassifier::get_W2()
 {
     return W2;
@@ -1283,7 +1450,7 @@ void NNClassifier::pre_compute(
         for (int j = 0; j < saved.ncols(); ++j)
             saved[i][j] = 0.0;
 
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for (size_t i = 0; i < candidates.size(); ++i)
     {
         int map_x = pre_map[candidates[i]];
@@ -1306,11 +1473,31 @@ void NNClassifier::pre_compute(
 
         // cerr << ". E_index = " << E_index;
 
+        Vec<double> project_tmp(0.0, emb_size);
+        if (config.embedding_project)
+        {
+            if (feat_type == Config::BASIC_FEAT)
+                for (int l = 0; l < emb_size; ++l)
+                    for(int r = 0; r < emb_size; ++r)
+                        project_tmp[l] += Eb[E_index][r] * P[l][r];
+        }
         for (int j = 0; j < config.hidden_size; ++j)
         {
             if (feat_type == Config::BASIC_FEAT)
-                for (int k = 0; k < emb_size; ++k)
-                    saved[map_x][j] += Eb[E_index][k] * W1[j][offset + k];
+            {
+                if (config.embedding_project)
+                {
+                    for (int k = 0; k < emb_size; ++k)
+                    {
+                        saved[map_x][j] += project_tmp[k] * W1[j][offset + k];
+                    }
+                }
+                else
+                {
+                    for (int k = 0; k < emb_size; ++k)
+                        saved[map_x][j] += Eb[E_index][k] * W1[j][offset + k];
+                }
+            }
             else if (feat_type == Config::DIST_FEAT)
                 for (int k = 0; k < emb_size; ++k)
                     saved[map_x][j] += Ed[E_index][k] * W1[j][offset + k];
@@ -1330,7 +1517,8 @@ void NNClassifier::pre_compute(
 
 void NNClassifier::compute_scores(
         vector<int>& features,
-        vector<double>& scores)
+        vector<double>& scores,
+        const int & dev_test_flag)
 {
     scores.clear();
     scores.resize(num_labels, 0.0);
@@ -1362,11 +1550,24 @@ void NNClassifier::compute_scores(
         }
         else
         {
+            Vec<double> project_tmp(0.0, emb_size);
+            if (config.embedding_project)
+                if (feat_type == Config::BASIC_FEAT)
+                    for (int l = 0; l < emb_size; ++l)
+                        for(int r = 0; r < emb_size; ++r)
+                            project_tmp[l] += Eb[E_index][r] * P[l][r];
+
             for (int j = 0; j < config.hidden_size; ++j)
             {
                 if (feat_type == Config::BASIC_FEAT)
-                    for (int k = 0; k < emb_size; ++k)
-                        hidden[j] += Eb[E_index][k] * W1[j][offset + k];
+                {
+                    /*if (dev_test_flag == 2) // test mode.
+                        for (int k = 0; k < emb_size; ++k)    // embeddings outside tuned model have been projected in load_model function.
+                            hidden[j] += Eb[E_index][k] * W1[j][offset + k];
+                    else if (dev_test_flag == 1) // dev mode.*/
+                        for (int k = 0; k < emb_size; ++k)
+                            hidden[j] += project_tmp[k] * W1[j][offset + k];
+                }
                 else if (feat_type == Config::DIST_FEAT)
                     for (int k = 0; k < emb_size; ++k)
                         hidden[j] += Ed[E_index][k] * W1[j][offset + k];
@@ -1388,9 +1589,9 @@ void NNClassifier::compute_scores(
     }
 
     for (int i = 0; i < num_labels; ++i)
-        for (int j = 0; j < config.hidden_size; ++j)
-            // no need to calculate exp
-            scores[i] += W2[i][j] * hidden[j];
+        for (size_t j = 0; j < config.hidden_size; ++j)
+             // no need to calculate exp
+             scores[i] += W2[i][j] * hidden[j];
 }
 
 void NNClassifier::clear_gradient_histories()
@@ -1402,6 +1603,7 @@ void NNClassifier::init_gradient_histories()
 {
     eg2W1.resize(W1.nrows(), W1.ncols()); eg2W1 = .0;
     eg2W2.resize(W2.nrows(), W2.ncols()); eg2W2 = .0;
+    eg2P.resize(P.nrows(),   P.ncols());  eg2P  = .0;
     eg2Eb.resize(Eb.nrows(), Eb.ncols()); eg2Eb = .0;
     eg2Ed.resize(Ed.nrows(), Ed.ncols()); eg2Ed = .0;
     eg2Ev.resize(Ev.nrows(), Ev.ncols()); eg2Ev = .0;
@@ -1425,6 +1627,7 @@ void Cost::merge(const Cost & c, bool & debug)
     Util::mat_inc(grad_Ed, c.grad_Ed);
     Util::mat_inc(grad_Ev, c.grad_Ev);
     Util::mat_inc(grad_Ec, c.grad_Ec);
+    Util::mat_inc(grad_P,  c.grad_P);
 
     if (debug)
         dropout_histories.insert(
@@ -1441,6 +1644,7 @@ void NNClassifier::print_info()
          << "\tEb: " << Eb.nrows() << " * " << Eb.ncols() << endl
          << "\tEd: " << Ed.nrows() << " * " << Ed.ncols() << endl
          << "\tEv: " << Ev.nrows() << " * " << Ev.ncols() << endl
-         << "\tEc: " << Ec.nrows() << " * " << Ec.ncols() << endl;
+         << "\tEc: " << Ec.nrows() << " * " << Ec.ncols() << endl
+         << "\tP:  " << P.nrows()  << " * " << P.ncols()  << endl;
 }
 

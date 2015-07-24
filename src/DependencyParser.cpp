@@ -5,27 +5,37 @@
 #include <cstdio>
 #include <cmath>
 #include <cassert>
+#include <boost/tuple/tuple.hpp>
+#include <omp.h>
+#include <assert.h>
 
 #include "ArcStandard.h"
 #include "DependencyParser.h"
 #include "Util.h"
 #include "Config.h"
+#include "Configuration.h"
 #include "time.h"
-
-#include <omp.h>
-// #include "../utils/io.h"
-// #include "../utils/logging.h"
+#include "Logging.h"
 
 using namespace std;
+
+int DependencyParser::dev_test_flag;    // 1=> dev; 2=> test
+
+DependencyParser::DependencyParser()
+{
+    candidate_transitions = new scored_transition_t[config.beam_size*2];
+}
 
 DependencyParser::DependencyParser(const char * cfg_filename)
 {
     config.set_properties(cfg_filename);
+    candidate_transitions = new scored_transition_t[config.beam_size*2];
 }
 
 DependencyParser::DependencyParser(string& cfg_filename)
 {
     config.set_properties(cfg_filename.c_str());
+    candidate_transitions = new scored_transition_t[config.beam_size*2];
 }
 
 DependencyParser::~DependencyParser()
@@ -38,6 +48,14 @@ DependencyParser::~DependencyParser()
     distance_ids.clear();
     valency_ids.clear();
     cluster_ids.clear();
+
+    delete [](candidate_transitions);
+    for (size_t i=0; i< lattice_heads.size(); ++i){
+      if(lattice_heads[i]){
+        delete [](lattice_heads[i]);
+        lattice_heads[i] = 0;
+      }
+    }
 }
 
 void DependencyParser::train(
@@ -121,7 +139,7 @@ void DependencyParser::train(
      * fill @known_words, @known_poss, @known_labels
      */
     cerr << "Generating dictionaries" << endl;
-    gen_dictionaries(train_sents, train_trees);
+    gen_dictionaries(train_sents, train_trees, dev_sents);
 
     // TODO
     vector<string> ldict = known_labels;
@@ -174,7 +192,8 @@ void DependencyParser::train(
         {
             classifier->pre_compute(); // with updated weights
             vector<DependencyTree> predicted;
-            predict(dev_sents, predicted);
+            dev_test_flag = 1;
+            predict(dev_sents, predicted, dev_test_flag);
 
             map<string, double> result;
             system->evaluate(dev_sents, predicted, dev_trees, result);
@@ -212,7 +231,8 @@ void DependencyParser::train(
     if (dev_file[0] != 0)
     {
         vector<DependencyTree> predicted;
-        predict(dev_sents, predicted);
+        dev_test_flag = 1;
+        predict(dev_sents, predicted, dev_test_flag);
         // get_uas_scoredouble uas = system->get_uas_score(dev_sents, predicted, dev_trees);
 
         map<string, double> result;
@@ -337,7 +357,8 @@ void DependencyParser::finetune(
 
 void DependencyParser::gen_dictionaries(
         vector<DependencySent> & sents,
-        vector<DependencyTree> & trees)
+        vector<DependencyTree> & trees,
+        vector<DependencySent> & dev_sents)
 {
     vector<string> all_words;
     vector<string> all_poss;
@@ -391,6 +412,17 @@ void DependencyParser::gen_dictionaries(
                     all_clusters.end(),
                     cluster_p6.begin(),
                     cluster_p6.end());
+        }
+    }
+
+    if (config.embedding_project)
+    {
+        for (size_t i = 0; i < dev_sents.size(); ++i)   // add words in dev file to the known_words set.
+        {
+            all_words.insert(
+                all_words.end(),
+                dev_sents[i].words.begin(),
+                dev_sents[i].words.end());
         }
     }
 
@@ -589,13 +621,20 @@ void DependencyParser::setup_classifier_for_training(
     Vec<double> b1(0.0, config.hidden_size);
     int n_actions = (config.labeled) ? (known_labels.size() * 2 - 1) : 3;
     Mat<double> W2(0.0, n_actions, config.hidden_size);
-
+    Mat<double> P(0.0, config.embedding_size, config.embedding_size);
+    
     // Randomly initialize weight matrices / vectors
     double W1_init_range = sqrt(6.0 / (W1.nrows() + W1.ncols()));
     #pragma omp parallel for
     for (int i = 0; i < W1.nrows(); ++i)
         for (int j = 0; j < W1.ncols(); ++j)
             W1[i][j] = (Util::rand_double() * 2 - 1) * W1_init_range;
+
+    double P_init_range = sqrt(6.0 / (P.nrows() + P.ncols()));
+    #pragma omp parallel for
+    for (int i = 0; i < P.nrows(); ++i)
+        for (int j = 0; j < P.ncols(); ++j)
+            P[i][j] = (Util::rand_double() * 2 - 1) * P_init_range;
 
     #pragma omp parallel for
     for (int i = 0; i < b1.size(); ++i)
@@ -650,7 +689,8 @@ void DependencyParser::setup_classifier_for_training(
                 Eb[i][j] = (Util::rand_double() * 2 - 1) * config.init_range;
         }
     }
-    Normalization_to_unitsphere(Eb);
+    if (config.normalization)
+        Normalization_to_unitsphere(Eb);
 
     #pragma omp parallel for
     for (int i = 0; i < Ed.nrows(); ++i)
@@ -768,6 +808,18 @@ void DependencyParser::setup_classifier_for_training(
                 W1[i][j] = to_double_sci(sep[i]);
         }
 
+        // set P
+        if (config.embedding_project)
+        {
+            for (int j = 0; j < P.ncols(); ++j)
+            {
+                getline(input, s);
+                sep = split(s);
+                for (int i = 0; i < P.nrows(); ++i)
+                    P[i][j] = to_double_sci(sep[i]);
+            }
+        }
+
         // set b1
         getline(input, s);
         sep = split(s);
@@ -802,15 +854,18 @@ void DependencyParser::setup_classifier_for_training(
      * setup the classifier
      */
     cerr << "create classifier" << endl;
-    classifier = new NNClassifier(config, dataset, Eb, Ed, Ev, Ec, W1, b1, W2, pre_computed_ids);
+    classifier = new NNClassifier(config, dataset, Eb, Ed, Ev, Ec, W1, b1, W2, P, pre_computed_ids);
 }
 
 void DependencyParser::generate_ids()
 {
     int index = 0;
 
-    for (size_t i = 0; i < known_words.size(); ++i)
+    for (size_t i = 0; i < known_words.size(); ++i) {
+        //if (i >= 12966)
+          //  cerr << known_words[i] << ".id = " << index <<"\t";
         word_ids[known_words[i]] = index++;
+    }//cerr << endl;
 
     if (config.delexicalized) // not counting words
         index = 0;
@@ -1052,9 +1107,10 @@ void DependencyParser::save_model(const string & filename)
  */
 void DependencyParser::Normalization_to_unitsphere(Mat<double>& embeddings)
 {
-    double l2norm = 0.0;
+    cerr << "Normalizing word embeddings..." << endl;
     for (int i=0; i< embeddings.nrows(); ++i)
     {
+        cerr << "\r" << i << " ";
         double l2norm = 0.0;
         for (int j=0; j< config.embedding_size; ++j)
         {
@@ -1066,7 +1122,6 @@ void DependencyParser::Normalization_to_unitsphere(Mat<double>& embeddings)
             embeddings[i][j] = embeddings[i][j] * l2norm;
         }
     }
-
 }
 
 void DependencyParser::save_model(const char * filename)
@@ -1078,6 +1133,7 @@ void DependencyParser::save_model(const char * filename)
     Mat<double>& W1 = classifier->get_W1();
     Mat<double>& W2 = classifier->get_W2();
     Vec<double>& b1 = classifier->get_b1();
+    Mat<double>& P  = classifier->get_P();
     Mat<double>& Eb = classifier->get_Eb();
     Mat<double>& Ed = classifier->get_Ed();
     Mat<double>& Ev = classifier->get_Ev();
@@ -1100,6 +1156,7 @@ void DependencyParser::save_model(const char * filename)
            << "valencytokens=" << config.num_valency_tokens << "\n"
            << "clustertokens=" << config.num_cluster_tokens << "\n"
            << "precomputed=" << pre_computed_ids.size() << "\n";
+           //<< "P.nrows=" << P.nrows() << "\n";
 
     int index = 0;
     // write word/pos/label embeddings
@@ -1169,10 +1226,20 @@ void DependencyParser::save_model(const char * filename)
             output << " " << W1[i][j];
         output << "\n";
     }
+
+    for (int j = 0; j < P.ncols(); ++j)
+    {
+        output << P[0][j];
+        for (int i = 1; i < P.nrows(); ++i)
+            output << " " << P[i][j];
+        output << "\n";
+    }
+
     output << b1[0];
     for (int i = 1; i < b1.size(); ++i)
         output << " " << b1[i];
     output << "\n";
+
     for (int j = 0; j < W2.ncols(); ++j)
     {
         output << W2[0][j];
@@ -1336,14 +1403,20 @@ int DependencyParser::get_word_id(const string & s)
     if (word_ids.find(sl) == word_ids.end())
     {
         sl = str_tolower(sl);
-        if (word_ids.find(sl) == word_ids.end())
+        if (word_ids.find(sl) != word_ids.end()) {
             return word_ids[sl];
+        }
         else
         {
             if (word_ids.find(Config::UNKNOWN) == word_ids.end())
+            {
                 return Config::NONEXIST;
+            }
             else
+            {
+                //cerr << s << " " <<word_ids[Config::UNKNOWN] << endl;
                 return word_ids[Config::UNKNOWN];
+            }
         }
     }
     else
@@ -1385,7 +1458,8 @@ int DependencyParser::get_cluster_id(const string & c)
 
 void DependencyParser::predict(
         DependencySent& sent,
-        DependencyTree& tree)
+        DependencyTree& tree,
+        const int & dev_test_flag)
 {
     int num_trans = system->transitions.size();
     Configuration c(sent);
@@ -1394,7 +1468,7 @@ void DependencyParser::predict(
     {
         vector<double> scores;
         vector<int> features = get_features(c);
-        classifier->compute_scores(features, scores);
+        classifier->compute_scores(features, scores, dev_test_flag);
 
         double opt_score = -DBL_MAX;
         string opt_trans = "";
@@ -1428,21 +1502,141 @@ void DependencyParser::predict(
     // return c.tree;
 }
 
+void DependencyParser::predict_global(
+        DependencySent& sent,
+        DependencyTree& tree,
+        const int & dev_test_flag)
+{
+    int num_trans = system->transitions.size();
+    Configuration* row = allocate_lattice(0);
+    row[0].init(sent);
+    // init lattice_size vector
+    lattice_size.clear();
+    lattice_size.push_back(1);
+    int step;
+    bool endflag = false;
+    for (step=1; step<= sent.n*2+1; ++step) {
+      cerr << "step=" << step << " , total step=" << sent.n*2 +1 << endl;
+      row = allocate_lattice(step);
+      lattice_size.push_back(0);
+      int& current_beam_size = lattice_size[step];
+      for (int j=0; j< lattice_size[step-1]; j++) {
+        Configuration* cc = lattice_heads[step-1]+j;
+        vector<double> scores;
+        vector<int> features = get_features(*cc);
+        for (int i=0; i< features.size(); ++i){
+            cerr << features[i] << " , " ;
+        }
+        cerr << endl;
+        classifier->compute_scores(features, scores, dev_test_flag);
+        for (int i = 0; i < num_trans; ++i)
+        {
+            if (system->can_apply(*cc, system->transitions[i]))
+            {
+                double total_score = log(exp(scores[i])) + log((*cc).score);
+                cerr << "i=" << i << " scores[i]="<<scores[i]<< " ,cc->score=" << (*cc).score << " ,log.total_score=" << log(exp(scores[i])) << " ,log.cc-score=" << log((*cc).score) << endl;
+                //double total_score = scores[i];
+                current_beam_size += extend_candidate_transitions(scored_transition_t(cc, 
+                      system->transitions[i], total_score), current_beam_size);
+            }
+        }cerr << endl;
+      }
+
+      //cerr << "current_beam_size=" << current_beam_size << endl;
+      for (int i=0; i< current_beam_size; i++){
+        scored_transition_t trans = candidate_transitions[i];
+        std::cerr << "apply action=" << trans.get<1>() << " score=" << trans.get<0>()->score;
+        //cerr << "configuration.stack_size =" << (*trans.get<0>()).get_stack_size() << endl;
+        Configuration source_state(*trans.get<0>());
+        system->apply(source_state, trans.get<1>()); //(configuration, trans).
+        row[i].copy(source_state);
+        row[i].score = trans.get<2>();
+      }
+
+      for (int i = 0; i < current_beam_size; ++ i) {
+        Configuration* cc = row+ i;
+        if (system->is_terminal(*cc)){
+          endflag = true;
+        }
+      }
+      if (endflag) break;
+    }
+
+    const Configuration* final_result = NULL;
+    for (const Configuration* i=row; i != row + lattice_size[step]; ++i){
+      if(final_result == NULL || i->score > final_result->score) {
+        final_result = i;
+      }
+    }
+    tree = final_result->tree;
+}
+
+int DependencyParser::extend_candidate_transitions(const scored_transition_t& trans
+          , int current_beam_size) 
+{
+  std::cerr << "e:current_beam_size=" << current_beam_size<< " , trans.trans=" 
+  << trans.get<1>() << " , trans.score=" << trans.get<2>()<< " beam="<< config.beam_size << endl;
+  if (current_beam_size == config.beam_size) {
+    cerr << candidate_transitions[0].get<2>() << endl;
+    cerr << trans.get<2>() << endl;
+    if (candidate_transitions[0].get<2>() < trans.get<2>()){
+      std::pop_heap(candidate_transitions,
+          candidate_transitions + config.beam_size,
+          ScoredTransitionMore);
+      candidate_transitions[config.beam_size-1] = trans;
+      std::push_heap(candidate_transitions,
+          candidate_transitions + config.beam_size,
+          ScoredTransitionMore);
+    }
+    return 0;
+  }
+  candidate_transitions[current_beam_size] = trans;
+  std::push_heap(candidate_transitions, candidate_transitions + current_beam_size + 1, ScoredTransitionMore);
+  return 1;
+}
+
+Configuration* DependencyParser::allocate_lattice(int index) {
+  if (index >= lattice_heads.size()){
+    for (int i = lattice_heads.size(); i <= index; ++ i) {
+      Configuration* lattice_head = new Configuration[config.beam_size+ 1];
+      lattice_heads.push_back(lattice_head);
+      // Allocate one more space to the dummy state.
+    }
+  }
+  return lattice_heads.at(index);
+}
+
+
 void DependencyParser::predict(
         vector<DependencySent>& sents,
-        vector<DependencyTree>& trees)
+        vector<DependencyTree>& trees,
+        const int & dev_test_flag)
 {
     // vector<DependencyTree> result;
     trees.clear();
     trees.resize(sents.size());
     // #pragma omp parallel for
-    for (size_t i = 0; i < sents.size(); ++i)
+    if (config.beam_size == 0)
     {
-        cerr << "\r" << i << "    ";
-        predict(sents[i], trees[i]);
-        // result.push_back(predict(sents[i]));
+        for (size_t i = 0; i < sents.size(); ++i)
+        {
+            cerr << "\r" << i << "    ";
+            predict(sents[i], trees[i], dev_test_flag);
+            // result.push_back(predict(sents[i]));
+        }
+        cerr << endl;
     }
-    cerr << endl;
+    else
+    {
+        cerr << "beam-search decoding!" << endl;
+        for (size_t i = 0; i < sents.size(); ++i)
+        {
+            cerr << "\r" << i << "    ";
+            predict_global(sents[i], trees[i], dev_test_flag);
+            // result.push_back(predict(sents[i]));
+        }
+
+    }
     // return result;
 }
 
@@ -1455,30 +1649,26 @@ void DependencyParser::load_model(const char * filename, bool re_precompute)
     ifstream input(filename);
 
     string s;
-    getline(input, s); int n_dict = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_pos = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_label = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_dist = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_valency = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_cluster = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int Eb_size = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int Ed_size = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int Ev_size = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int Ec_size = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int h_size = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_basic_tokens = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_dist_tokens = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_dict           = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_pos            = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_label          = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_dist           = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_valency        = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_cluster        = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Eb_size          = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Ed_size          = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Ev_size          = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int Ec_size          = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int h_size           = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_basic_tokens   = to_int(split_by_sep(s, "=")[1]);
+    getline(input, s); int n_dist_tokens    = to_int(split_by_sep(s, "=")[1]);
     getline(input, s); int n_valency_tokens = to_int(split_by_sep(s, "=")[1]);
     getline(input, s); int n_cluster_tokens = to_int(split_by_sep(s, "=")[1]);
-    getline(input, s); int n_pre_computed = to_int(split_by_sep(s, "=")[1]);
-
+    getline(input, s); int n_pre_computed   = to_int(split_by_sep(s, "=")[1]);
     known_words.clear();
     known_poss.clear();
     known_labels.clear();
-    known_distances.clear();
-    known_valencies.clear();
-    known_clusters.clear();
-
+    
     int index = 0;
 
     /*
@@ -1600,15 +1790,20 @@ void DependencyParser::load_model(const char * filename, bool re_precompute)
     {
         getline(input, s);
         vector<string> sep = split(s);
-
         assert (sep.size() == h_size);
         for (int i = 0; i < W1.nrows(); ++i)
             W1[i][j] = to_double_sci(sep[i]);
     }
-
     Vec<double> b1(h_size);
     getline(input, s);
     vector<string> sep = split(s);
+    if (sep.size() == Eb_size){
+        for (int r=0; r <50; r++)
+        {
+            getline(input, s);
+            sep = split(s);
+        }
+    }
     assert (sep.size() == h_size);
     for (int i = 0; i < b1.size(); ++i)
     {
@@ -1636,10 +1831,11 @@ void DependencyParser::load_model(const char * filename, bool re_precompute)
     }
 
     input.close();
+    Mat<double> P(0.0, Eb_size, Eb_size);
     if (re_precompute)
-        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, vector<int>());
+        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, P, vector<int>());
     else
-        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, pre_computed_ids);
+        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, P, pre_computed_ids);
 
     vector<string> ldict = known_labels;
     if (config.labeled) ldict.pop_back(); // remove the NIL label
@@ -1704,6 +1900,7 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
     getline(input, s); int n_valency_tokens = to_int(split_by_sep(s, "=")[1]);
     getline(input, s); int n_cluster_tokens = to_int(split_by_sep(s, "=")[1]);
     getline(input, s); int n_pre_computed = to_int(split_by_sep(s, "=")[1]);
+    //getline(input, s); int P_rows           = to_int(split_by_sep(s, "=")[1]);
 
     known_words.clear();
     known_poss.clear();
@@ -1751,45 +1948,76 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
     /*added the pre-trained embeddings to the tail of Eb*/
     std::vector<std::string> test_words;
     loadwords_testfile(test_file, test_words);
-    std::cerr << "Loading embeddings from embedding file:" << embed_file << endl;
     read_embed_file(embed_file);
 
     int emb_items = 0;
+    int tuned_emb = 0;
     for (int idx=0; idx < test_words.size(); ++idx) {
         if (embed_ids.find(test_words[idx]) != embed_ids.end()){
-          emb_items += 1;
-        }
-    }
-
-    Mat<double> Eo(0.0, emb_items, Eb_size);
-    int additional = 0;
-    for (int idx=0; idx < test_words.size(); ++idx) {
-        if (embed_ids.find(test_words[idx]) != embed_ids.end()){
-          int i = 0;
-          for(i=0; i < known_words.size(); ++i) {
-              if(known_words[i] == test_words[idx])
-                  break;
-          }
-          if(i == known_words.size()){
-              int embed_index = embed_ids[test_words[idx]];
-              known_words.push_back(test_words[idx]);
-              assert(embeddings.ncols() == Eb_size);
-              for(int j=0; j < Eb_size; ++j) {
-                  Eo[additional][j] = embeddings[embed_index][j];
-              }
-              additional += 1;
-              index += 1;
+            int k;
+            for (k = 0; k < known_words.size(); ++k)
+            {
+                if(known_words[k] == test_words[idx]) {
+                    tuned_emb += 1;
+                    break;
+                }
+            }
+            if (k == known_words.size())
+            {
+                emb_items += 1;
             }
         }
     }
-    Normalization_to_unitsphere(Eo);
+    std::cerr << "test words size: " << test_words.size() << std::endl;
+    std::cerr << "emb_itmes in test_file not in model: " << emb_items << std::endl;
+
+    Mat<double> Eo(0.0, emb_items, Eb_size);
+    int additional = 0;
+    int tuned_items = 0;
+    int additional2 = 0;
+    for (int idx=0; idx < test_words.size(); ++idx) {
+        int k;
+        for (k = 0; k < known_words.size(); ++k){
+            if (known_words[k] == test_words[idx]){
+                tuned_items += 1;
+                break;
+            }
+        }
+        if (k == known_words.size())
+        {
+            if (embed_ids.find(test_words[idx]) != embed_ids.end())
+            {
+                int embed_index = embed_ids[test_words[idx]];
+                known_words.push_back(test_words[idx]);
+                assert(embeddings.ncols() == Eb_size);
+                for(int j=0; j < Eb_size; ++j)
+                {
+                    Eo[additional][j] = embeddings[embed_index][j];
+                }
+                additional += 1;
+                //cerr << test_words[idx] << " ";
+                index += 1;
+            }else {
+                additional2 += 1;
+                //cerr << test_words[idx] << " | ";
+            }
+        }
+    }
+    //std::cerr <<endl << "model known words and embeddings in emb_file in test_file : " << tuned_emb << std::endl;
+    //std::cerr << "model known words in test_file : " << tuned_items << std::endl;
+    std::cerr << "out of training file  = " << additional + additional2 << endl;
+    std::cerr << "real OOV = " << additional2 << endl;
+    assert(additional == emb_items);
+
+    if (config.normalization)
+        Normalization_to_unitsphere(Eo);
 
     Mat<double>Eb(0.0, Eb_entries + additional, Eb_size);
     int i;
     for(i = 0; i < Em.nrows(); ++i)
     {
         for(int j=0; j < Em.ncols(); ++j)
-             Eb[i][j] = Em[i][j];
+             Eb[i][j] = Em[i][j];       // embeddings in tuned model do not project any more.
     }
     for (int k=0; k< additional; ++k)
     {
@@ -1798,6 +2026,9 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
         i += 1;
     }
     assert(i == index);
+    std::cerr << "outer file words in test_file: " << additional << std::endl;
+
+    cerr << "embeddings num in tuned model = " << i << endl;
     /*end of read pre-trained embeddings*/
 
     if (config.use_postag)
@@ -1878,7 +2109,7 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
                 + Ed_size * n_dist_tokens
                 + Ev_size * n_valency_tokens
                 + Ec_size * n_cluster_tokens;
-
+    //cerr << "W1_ncol=" << W1_ncol << endl;
     Mat<double> W1(h_size, W1_ncol);
     for (int j = 0; j < W1.ncols(); ++j)
     {
@@ -1890,9 +2121,61 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
             W1[i][j] = to_double_sci(sep[i]);
     }
 
+    Mat<double> P(Eb_size, Eb_size);
+    cerr << "Loading P matrix..." << endl;
+    for (int j = 0; j < P.ncols(); ++j)
+    {
+        getline(input, s);
+        vector<string> sep = split(s);
+        //cerr << "read P, sep.size=" << sep.size() << ", Eb_size=" << Eb_size << endl;
+        assert (sep.size() == Eb_size);
+        for (int i = 0; i < P.nrows(); ++i) {
+            P[i][j] = to_double_sci(sep[i]);
+        }
+    }
+
+    /*if (config.embedding_project)
+    {
+        cerr << Eo.nrows() << endl;
+        Mat<double>Eo_tmp(0.0, additional, Eo.ncols());
+        for (int j = 0; j < additional; ++j) //embeddings not in tuned model do projection here.
+        {
+            for (int k = 0; k < Eb_size; ++k)
+            {
+                double project_tmp = 0.0;
+                for (int r = 0; r < Eb_size; ++r)
+                    project_tmp += Eo[j][r] * P[k][r];
+                Eo_tmp[j][k] = project_tmp;
+            }
+        }
+        cerr << Em.nrows() <<"Em.size Eb.size" << Eb.nrows() << endl;
+        int i = Em.nrows();
+        assert(Eo_tmp.ncols()==Eb_size);
+        for (int k=0; k< Eo_tmp.nrows(); ++k) // replace Eo embeddings with projected ones.
+        {
+            //cerr << "k=" << k << endl;
+            for(int j=0; j< Eo_tmp.ncols(); ++j)
+            {
+                Eb[i][j] = Eo_tmp[k][j];
+                //cerr << Eb[i][j] << " ";
+            }
+            //cerr << endl;
+            i += 1;
+        }
+        cerr << Eb.nrows() << endl;
+    } else {
+        for (int j = 0; j < P.ncols(); ++j)
+            for(int k = 0; k < P.nrows(); ++k)
+                P[j][k] = 0.0;
+        cerr <<"zero P" << endl;
+    }*/
+    /*end of read pre-trained embeddings*/
+    cerr << "Eb over" << endl;
+
     Vec<double> b1(h_size);
     getline(input, s);
     vector<string> sep = split(s);
+    //cerr << "h_size=" << h_size << " , sep.size=" << sep.size() << endl;
     assert (sep.size() == h_size);
     for (int i = 0; i < b1.size(); ++i)
     {
@@ -1921,9 +2204,9 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
 
     input.close();
     if (re_precompute)
-        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, vector<int>());
+        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, P, vector<int>());
     else
-        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, pre_computed_ids);
+        classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, P, pre_computed_ids);
 
     vector<string> ldict = known_labels;
     if (config.labeled) ldict.pop_back(); // remove the NIL label
@@ -1940,11 +2223,10 @@ void DependencyParser::load_model(const char * filename, const char * embed_file
 
 void DependencyParser::load_model(const string & filename, const std::string & embed_file, const std::string & test_file, bool re_precompute)
 {
-    if( !config.fix_word_embeddings)
-        load_model(filename.c_str(), re_precompute);
-    else
+    if( config.fix_word_embeddings || config.embedding_project)
         load_model(filename.c_str(), embed_file.c_str(), test_file.c_str(), re_precompute );
-
+    else
+        load_model(filename.c_str(), re_precompute);
 }
 
 /**
@@ -2146,6 +2428,17 @@ void DependencyParser::load_model_cl(
             W1[i][j] = to_double_sci(sep[i]);
     }
 
+    Mat<double> P(Eb_size, Eb_size);
+    for (int j = 0; j < P.ncols(); ++j)
+    {
+        getline(input, s);
+        vector<string> sep = split(s);
+
+        assert (sep.size() == h_size);
+        for (int i = 0; i < P.nrows(); ++i)
+            P[i][j] = to_double_sci(sep[i]);
+    }
+
     Vec<double> b1(h_size);
     getline(input, s);
     vector<string> sep = split(s);
@@ -2177,7 +2470,7 @@ void DependencyParser::load_model_cl(
     }
 
     input.close();
-    classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, vector<int>());
+    classifier = new NNClassifier(config, Eb, Ed, Ev, Ec, W1, b1, W2, P, vector<int>());
     vector<string> ldict = known_labels;
     if (config.labeled)
         ldict.pop_back(); // remove the NIL label
@@ -2227,8 +2520,10 @@ void DependencyParser::test(
         n_words += test_sents[i].n;
 
     vector<DependencyTree> predicted;
-    predict(test_sents, predicted);
 
+    dev_test_flag = 2;
+    predict(test_sents, predicted, dev_test_flag);
+    
     map<string, double> result;
     system->evaluate(test_sents, predicted, test_trees, result);
     double las_wo_punc = result["LASwoPunc"];

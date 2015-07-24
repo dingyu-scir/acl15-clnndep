@@ -21,6 +21,26 @@ Configuration::Configuration(DependencySent& s)
     init(s);
 }
 
+void Configuration::copy(Configuration& c)
+{
+    //stack  = c.stack;
+    //buffer = c.buffer;
+    tree   = c.tree;
+    sent   = c.sent;
+    stack.clear();
+    buffer.clear();
+    lvalency.clear();
+    rvalency.clear();
+    for (int i=0; i< c.stack.size(); ++i)
+      stack.push_back(c.stack[i]);
+    for (int i=0; i< c.buffer.size();++i)
+      buffer.push_back(c.buffer[i]);
+    for (int i=0; i< c.lvalency.size(); ++i)
+      lvalency.push_back(c.lvalency[i]);
+    for (int i=0; i< c.rvalency.size(); ++i)
+      rvalency.push_back(c.rvalency[i]);
+}
+
 void Configuration::init(DependencySent& s)
 {
     stack.clear();
@@ -30,6 +50,8 @@ void Configuration::init(DependencySent& s)
     rvalency.clear();
 
     sent = s;
+    tree.init();
+
     for (int i = 1; i <= sent.n; ++i)
     {
         tree.add(Config::NONEXIST, Config::UNKNOWN);
